@@ -254,14 +254,10 @@ with gr.Blocks(title="SQL BI — OpenEnv") as gradio_ui:
     task_dd.change(ui_start_task, [task_dd], [obs_md, reward_md, prev_box, state_box])
     gradio_ui.load(lambda: ui_start_task(CHOICES[0][1]),
                    outputs=[obs_md, reward_md, prev_box, state_box])
-
-
+    
+    
 # ── Mount Gradio onto FastAPI ──────────────────────────────────────────────────
-app = gr.mount_gradio_app(api, gradio_ui, path="/ui")
-
-# Also serve Gradio at root so HF Spaces shows the UI by default
-app = gr.mount_gradio_app(app, gradio_ui, path="/")
-
+app = gr.mount_gradio_app(api, gradio_ui, path="/")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Entry point
