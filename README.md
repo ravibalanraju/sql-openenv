@@ -1,206 +1,201 @@
+---
+title: SQL Business Intelligence OpenEnv
+emoji: 🗄️
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # 🗄️ SQL Business Intelligence — OpenEnv
 
-> **Scaler OpenEnv Hackathon** — real-world agent environment
+An AI agent training environment where agents learn to answer real business questions by writing SQL queries against a retail database.
 
-An AI agent receives a natural-language business question and must write a SQL query to answer it correctly from a retail database. Tasks range from a simple `COUNT(*)` (easy) to multi-table CTEs with discount-aware aggregations (hard).
+## 🎯 Environment Description
 
-**Why this domain?** Natural-language-to-SQL is one of the highest-value agent capabilities in industry. Every BI team, data analyst, and product manager would immediately benefit from a reliable SQL-writing agent. This environment gives the RL community a rigorous, reproducible benchmark for training and evaluating such agents.
+The agent is given a business question (e.g. *"Which are the top 3 products by revenue?"*) and must write a SQL query to answer it correctly. The environment scores the query based on correctness, syntax validity, and number of attempts.
 
----
-
-## 🗂 Project structure
-
-```
-openenv-sql/
-├── env/
-│   ├── __init__.py        # Package exports
-│   ├── models.py          # Typed Pydantic models (Action, Observation, Reward, State)
-│   ├── database.py        # SQLite schema + ~60 seed rows + safe_execute()
-│   ├── tasks.py           # 9 TaskDefinition objects (easy / medium / hard)
-│   ├── graders.py         # Partial-credit scoring per answer type
-│   └── environment.py     # SQLBusinessEnv: reset / step / state + benchmark runner
-├── inference.py           # Baseline agents: rule-based, random, LLM (OpenAI)
-├── app.py                 # Gradio UI → HuggingFace Spaces
-├── openenv.yaml           # OpenEnv spec manifest
-├── Dockerfile             # HF Spaces-compatible container
-├── requirements.txt
-└── README.md
-```
+**Why this task is real-world:**
+- Every company has databases with business data
+- SQL is a top-10 skill used by analysts daily
+- Answering business questions from data is a core enterprise workflow
 
 ---
 
-## 📐 OpenEnv API
+## 🗃️ Database Schema
+
+A seeded SQLite retail database with 5 tables:
+
+| Table | Rows | Description |
+|-------|------|-------------|
+| customers | 10 | name, city, state, email |
+| products | 10 | name, category, price |
+| orders | 15 | customer, date, status, discount |
+| order_items | 25 | product, quantity, unit_price |
+| returns | 3 | order, reason, date |
+
+---
+
+## 📋 Action Space
+
+```python
+class SQLAction:
+    sql_query: str   # A valid SQL SELECT statement
+```
+
+The agent submits a SQL query string. Only `SELECT` and `WITH...SELECT` (CTEs) are allowed. Destructive statements (`DROP`, `INSERT`, `UPDATE`, etc.) are blocked.
+
+---
+
+## 👁️ Observation Space
+
+```python
+class Observation:
+    task_id: str          # e.g. "medium_01"
+    difficulty: str       # "easy" | "medium" | "hard"
+    question: str         # The business question to answer
+    schema_info: str      # Full database schema description
+    attempt: int          # Current attempt number (max 4)
+    max_attempts: int     # Always 4
+    previous_query: str   # Last submitted SQL (or None)
+    previous_result: str  # Last query result (or None)
+    previous_score: float # Last reward score (or None)
+    hint: str             # Revealed after first failed attempt
+```
+
+---
+
+## 🎁 Reward Function
+
+```
+reward = clamp(correctness + syntax_bonus - attempt_penalty × attempt, 0.0, 1.0)
+```
+
+| Signal | Value | Description |
+|--------|-------|-------------|
+| correctness | 0.0 – 1.0 | How correct the answer is |
+| syntax_bonus | +0.05 | SQL ran without error (valid syntax) |
+| attempt_penalty | −0.10 per retry | Encourages getting it right first try |
+
+**Partial credit is supported** — agents get signal on every attempt, not just at episode end.
+
+---
+
+## 📝 Tasks
+
+### 🟢 Easy (single table, basic SQL)
+| ID | Question |
+|----|----------|
+| easy_01 | How many customers are from New York state? |
+| easy_02 | What is the price of the Ergonomic Chair? |
+| easy_03 | How many orders have status "completed"? |
+
+### 🟡 Medium (joins + aggregation)
+| ID | Question |
+|----|----------|
+| medium_01 | List the top 3 products by total revenue |
+| medium_02 | What is the total net revenue from completed orders after discounts? |
+| medium_03 | Which product category has earned the most revenue? |
+
+### 🔴 Hard (subqueries, CTEs, complex logic)
+| ID | Question |
+|----|----------|
+| hard_01 | Which customer has placed the most orders? |
+| hard_02 | What is the total revenue per month for 2024? |
+| hard_03 | List customers whose total net spend is above the average |
+
+---
+
+## 🚀 Setup & Usage
+
+### Local Setup
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run rule-based baseline (no API key needed)
+python inference.py --agent rule_based --verbose
+
+# Run web UI
+python app.py
+# Open http://localhost:7860
+```
+
+### REST API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/reset` | POST | Start a new episode |
+| `/step` | POST | Submit a SQL action |
+| `/state` | GET | Get current environment state |
+| `/tasks` | GET | List all available tasks |
+| `/health` | GET | Health check |
+
+### Example API Usage
+
+```bash
+# Reset environment
+curl -X POST http://localhost:7860/reset \
+  -H "Content-Type: application/json" \
+  -d '{"task_id": "medium_01"}'
+
+# Submit a SQL query
+curl -X POST http://localhost:7860/step \
+  -H "Content-Type: application/json" \
+  -d '{"sql_query": "SELECT p.name FROM products p LIMIT 3"}'
+
+# Check state
+curl http://localhost:7860/state
+```
+
+### Python Usage
 
 ```python
 from env import SQLBusinessEnv, SQLAction
 
 env = SQLBusinessEnv(seed=42)
-
-# 1. reset — start an episode
 obs = env.reset("medium_01")
-print(obs.question)      # "List the top 3 products by total gross revenue..."
-print(obs.schema_info)   # Database DDL
-print(obs.difficulty)    # "medium"
+print(obs.question)
 
-# 2. step — submit a SQL query
 action = SQLAction(sql_query="""
     SELECT p.name
-    FROM order_items oi JOIN products p ON oi.product_id = p.id
+    FROM order_items oi
+    JOIN products p ON oi.product_id = p.id
     GROUP BY p.id, p.name
     ORDER BY SUM(oi.quantity * oi.unit_price) DESC
     LIMIT 3
 """)
+
 result = env.step(action)
-print(result.reward)              # 1.0 if correct on first try
-print(result.reward_detail)       # breakdown: correctness, penalty, syntax_bonus
-print(result.done)                # True when solved or max attempts reached
-print(result.info["reason"])      # "Exact ordered match."
-
-# 3. state — inspect full episode
-state = env.state()
-print(state.best_reward)          # best reward this episode
-print(state.best_query)           # SQL that produced that reward
-print(state.episode_history)      # full attempt log
+print(result.reward)         # 1.0
+print(result.info["reason"]) # "Exact ordered match."
 ```
 
 ---
 
-## 📊 Observation space
+## 📊 Baseline Scores
 
-| Field | Type | Description |
-|---|---|---|
-| `task_id` | `str` | Unique task identifier |
-| `difficulty` | `str` | `easy` \| `medium` \| `hard` |
-| `question` | `str` | Natural-language BI question |
-| `schema_info` | `str` | Full database schema DDL |
-| `attempt` | `int` | 0-indexed attempt counter |
-| `max_attempts` | `int` | Maximum attempts for this task |
-| `previous_query` | `str?` | Last SQL submitted (None on first step) |
-| `previous_result` | `str?` | Truncated result of the last query |
-| `previous_score` | `float?` | Reward from the last step |
-| `hint` | `str?` | Revealed after the first wrong attempt |
+| Agent | Score | Description |
+|-------|-------|-------------|
+| RuleBasedAgent | 1.0000 | Hard-coded correct SQL for all tasks |
+| RandomAgent | ~0.0000 | Random SQL — almost always fails |
+| LLMAgent (GPT-4o-mini) | ~0.75 | Uses OpenAI API to generate SQL |
 
-## 🎯 Action space
-
-| Field | Type | Description |
-|---|---|---|
-| `sql_query` | `str` | A SQLite `SELECT` or `WITH…SELECT` statement |
-
-Only read operations are permitted. DML/DDL is blocked.
-
----
-
-## 🏆 Tasks
-
-### Easy
-
-| ID | Question |
-|---|---|
-| `easy_01` | How many customers are from New York state? |
-| `easy_02` | What is the unit price of the Ergonomic Chair? |
-| `easy_03` | How many orders have status = 'completed'? |
-
-*Requires: single-table SELECT with WHERE / COUNT. No JOINs needed.*
-
-### Medium
-
-| ID | Question |
-|---|---|
-| `medium_01` | Top 3 products by total gross revenue (JOIN + GROUP BY + ORDER BY) |
-| `medium_02` | Total net revenue from completed orders (discount-aware aggregation) |
-| `medium_03` | Category with highest total gross revenue |
-
-*Requires: 2-table JOIN, GROUP BY, aggregation, ORDER BY.*
-
-### Hard
-
-| ID | Question |
-|---|---|
-| `hard_01` | Customer(s) who placed the most orders (HAVING + subquery) |
-| `hard_02` | Monthly revenue breakdown for 2024 (date bucketing, concatenated output) |
-| `hard_03` | Customers whose net spend exceeds per-customer average (CTE + AVG subquery) |
-
-*Requires: CTEs, HAVING clauses, subqueries, date functions, multi-join.*
-
----
-
-## 🎁 Reward function
-
-```
-reward = clamp(correctness + syntax_bonus − attempt_penalty × attempt, 0.0, 1.0)
-```
-
-| Component | Value | Rationale |
-|---|---|---|
-| `correctness` | 0.0–1.0 | Grader score (type-specific, with partial credit) |
-| `syntax_bonus` | +0.05 | SQL ran without error — valid signal even when answer is wrong |
-| `attempt_penalty` | −0.10 × attempt | Encourages solving on the first try |
-
-### Partial credit by answer type
-
-| Type | 1.0 | 0.5 | < 0.5 | 0.0 |
-|---|---|---|---|---|
-| `scalar_int` | Exact | — | — | Wrong |
-| `scalar_float` | Within ±0.02 | Within ±0.10 | — | Far off |
-| `scalar_string` | Case-insensitive match | — | — | Wrong |
-| `ordered_list` | Exact ordered match | Right items, wrong order | Proportional overlap | No match |
-
----
-
-## 🗄️ Database schema
-
-```
-customers   (id, name, city, state, email, signup_date)
-products    (id, name, category, unit_price, stock_qty)
-orders      (id, customer_id, order_date, status, discount_pct)
-order_items (id, order_id, product_id, quantity, unit_price)
-returns     (id, order_id, product_id, return_date, reason)
-```
-
-SQLite 3, in-memory, seeded deterministically on startup (~60 rows total).
-
----
-
-## ⚡ Setup and usage
-
-### Install
+### Run Baselines
 
 ```bash
-pip install -r requirements.txt
-```
-
-### Run the rule-based baseline (no API key)
-
-```bash
+# Rule-based (no API key)
 python inference.py --agent rule_based --verbose
-```
 
-Expected output:
-```
-  [easy_01     ] [██████████] 1.0000  (1 attempts)
-  [easy_02     ] [██████████] 1.0000  (1 attempts)
-  ...
-  Normalized : 1.0000
-```
+# Random agent
+python inference.py --agent random --verbose
 
-### Run the LLM agent (OpenAI)
-
-```bash
-export OPENAI_API_KEY=sk-...
-python inference.py --agent llm --model gpt-4o-mini --verbose
-```
-
-### Debug a single task
-
-```bash
-python inference.py --agent rule_based --task hard_03 --verbose
-```
-
-### Launch Gradio UI
-
-```bash
-python app.py
-# Open http://localhost:7860
+# LLM agent (requires API key)
+export API_BASE_URL=https://api.openai.com/v1
+export MODEL_NAME=gpt-4o-mini
+export HF_TOKEN=your_token_here
+python inference.py --agent llm --verbose
 ```
 
 ---
@@ -210,56 +205,26 @@ python app.py
 ```bash
 docker build -t sql-openenv .
 docker run -p 7860:7860 sql-openenv
-# With LLM agent: docker run -e OPENAI_API_KEY=sk-... -p 7860:7860 sql-openenv
 ```
 
 ---
 
-## 🚀 Deploy to HuggingFace Spaces
+## 📁 Project Structure
 
-1. Create a new Space at https://huggingface.co/spaces (SDK: **Gradio**)
-2. Push this repo:
-
-```bash
-git init && git add . && git commit -m "initial"
-git remote add hf https://huggingface.co/spaces/<YOUR_USERNAME>/sql-business-intelligence
-git push hf main
 ```
-
-The Space auto-builds from `Dockerfile`.
-
----
-
-## 📈 Baseline scores
-
-| Agent | Easy avg | Medium avg | Hard avg | Normalized |
-|---|---|---|---|---|
-| `rule_based` (deterministic) | 1.0000 | 1.0000 | 1.0000 | **1.0000** |
-| `random` (seed=42) | ~0.056 | ~0.056 | ~0.056 | **~0.056** |
-| `llm gpt-4o-mini` (temp=0) | ~0.95 | ~0.85 | ~0.65 | **~0.82** |
-
-To reproduce rule-based baseline exactly:
-```bash
-python inference.py --agent rule_based --seed 42 --output baseline_results.json
-```
-
----
-
-## 🔑 Writing your own agent
-
-```python
-from env import SQLBusinessEnv, SQLAction, Observation
-
-def my_agent(obs: Observation) -> SQLAction:
-    # obs.question       — what to answer
-    # obs.schema_info    — the database schema
-    # obs.previous_result — feedback from last attempt
-    # obs.hint           — hint revealed after first wrong attempt
-    return SQLAction(sql_query="SELECT 42")   # replace with your logic
-
-env = SQLBusinessEnv(seed=42)
-bm  = env.run_benchmark(my_agent, verbose=True)
-print(f"Score: {bm.normalized_score:.4f}")
+├── env/
+│   ├── __init__.py        # Package exports
+│   ├── models.py          # Typed models: SQLAction, Observation, Reward, EnvState
+│   ├── database.py        # SQLite schema, seed data, safe_execute()
+│   ├── tasks.py           # 9 TaskDefinition objects (easy/medium/hard)
+│   ├── graders.py         # Scoring with partial credit
+│   └── environment.py     # SQLBusinessEnv: reset/step/state/run_benchmark
+├── app.py                 # FastAPI + Gradio UI (HuggingFace Spaces)
+├── inference.py           # Baseline agents: rule_based, random, llm
+├── openenv.yaml           # OpenEnv spec manifest
+├── Dockerfile             # HF Spaces container
+├── requirements.txt       # Python dependencies
+└── README.md              # This file
 ```
 
 ---
