@@ -255,9 +255,11 @@ with gr.Blocks(title="SQL BI — OpenEnv") as gradio_ui:
     gradio_ui.load(lambda: ui_start_task(CHOICES[0][1]),
                    outputs=[obs_md, reward_md, prev_box, state_box])
     
-    
-# ── Mount Gradio onto FastAPI ──────────────────────────────────────────────────
-app = gr.mount_gradio_app(api, gradio_ui, path="/")
+app = gr.mount_gradio_app(api, gradio_ui, path="/gradio")
+
+@api.get("/")
+def root():
+    return JSONResponse({"status": "ok", "ui": "/gradio", "health": "/health"})
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Entry point
