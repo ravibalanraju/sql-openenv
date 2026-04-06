@@ -1,0 +1,175 @@
+---
+# OpenEnv specification manifest
+# Validated by: openenv validate
+
+name: sql-business-intelligence
+version: "1.0.0"
+description: >
+  A real-world environment in which an AI agent answers business intelligence
+  questions by writing SQL queries against a SQLite retail database.
+  Tasks range from simple aggregate lookups (easy) to multi-join CTEs with
+  subqueries (hard). Partial credit rewards trajectory progress.
+
+tags:
+  - openenv
+  - sql
+  - business-intelligence
+  - data-analysis
+  - real-world
+
+author: "Scaler OpenEnv Hackathon"
+license: MIT
+python_requires: ">=3.9"
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+entry_point: "env:SQLBusinessEnv"
+env_id: "sql-business-intelligence-v1"
+
+# ── Typed models ──────────────────────────────────────────────────────────────
+models:
+  action:
+    class: env.models.SQLAction
+    fields:
+      sql_query: {type: string, description: "A SQLite SELECT or WITH…SELECT statement."}
+
+  observation:
+    class: env.models.Observation
+    fields:
+      task_id:         {type: string}
+      difficulty:      {type: string, enum: [easy, medium, hard]}
+      question:        {type: string, description: "Natural-language BI question."}
+      schema_info:     {type: string, description: "Retail database DDL."}
+      attempt:         {type: integer, minimum: 0}
+      max_attempts:    {type: integer, minimum: 1}
+      previous_query:  {type: string, nullable: true}
+      previous_result: {type: string, nullable: true}
+      previous_score:  {type: number, minimum: 0.0, maximum: 1.0, nullable: true}
+      hint:            {type: string, nullable: true, description: "Revealed after first wrong attempt."}
+
+  reward:
+    class: env.models.Reward
+    fields:
+      value:           {type: number, minimum: 0.0, maximum: 1.0}
+      correctness:     {type: number, minimum: 0.0, maximum: 1.0}
+      attempt_penalty: {type: number, minimum: 0.0, maximum: 1.0}
+      syntax_bonus:    {type: number, minimum: 0.0, maximum: 1.0}
+      reason:          {type: string}
+
+# ── API ───────────────────────────────────────────────────────────────────────
+api:
+  reset:
+    signature: "reset(task_id: Optional[str] = None) -> Observation"
+    description: >
+      Starts a new episode. Pass task_id to run a specific task,
+      or omit to sample randomly from all tasks.
+
+  step:
+    signature: "step(action: SQLAction) -> StepResult"
+    description: >
+      Submits a SQL query and returns (observation, reward, done, info).
+      reward ∈ [0.0, 1.0]. done=True when solved or max_attempts exhausted.
+
+  state:
+    signature: "state() -> EnvState"
+    description: >
+      Returns a full snapshot of the current episode state including
+      step history, best reward, and best query so far.
+
+# ── Reward ────────────────────────────────────────────────────────────────────
+reward:
+  range: [0.0, 1.0]
+  partial_credit: true
+  trajectory_signal: true
+  components:
+    correctness:
+      description: "Grader score for answer correctness (0.0–1.0 with partial credit)."
+    syntax_bonus:
+      value: 0.05
+      description: "Awarded when the SQL runs without error, even if the answer is wrong."
+    attempt_penalty:
+      value: 0.10
+      description: "Deducted per attempt after the first. Encourages solving on first try."
+  formula: "clamp(correctness + syntax_bonus - attempt_penalty * attempt, 0.0, 1.0)"
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+tasks:
+  - id: easy_01
+    difficulty: easy
+    description: "Count customers in a given US state."
+    max_attempts: 3
+  - id: easy_02
+    difficulty: easy
+    description: "Look up a product's unit price by name."
+    max_attempts: 3
+  - id: easy_03
+    difficulty: easy
+    description: "Count orders with a given status."
+    max_attempts: 3
+  - id: medium_01
+    difficulty: medium
+    description: "Top 3 products by gross revenue (JOIN + GROUP BY)."
+    max_attempts: 3
+  - id: medium_02
+    difficulty: medium
+    description: "Total net revenue from completed orders (discount-aware)."
+    max_attempts: 3
+  - id: medium_03
+    difficulty: medium
+    description: "Category with highest gross revenue."
+    max_attempts: 3
+  - id: hard_01
+    difficulty: hard
+    description: "Customer(s) with the most orders placed (HAVING + subquery)."
+    max_attempts: 4
+  - id: hard_02
+    difficulty: hard
+    description: "Monthly gross revenue breakdown for 2024 (date bucketing)."
+    max_attempts: 4
+  - id: hard_03
+    difficulty: hard
+    description: "Customers with above-average net spend (CTE + AVG subquery)."
+    max_attempts: 4
+
+# ── Baseline scores ───────────────────────────────────────────────────────────
+baseline_scores:
+  rule_based:
+    agent: RuleBasedAgent (deterministic)
+    normalized: 1.0000
+    easy_avg:   1.0000
+    medium_avg: 1.0000
+    hard_avg:   1.0000
+    notes: "Hard-coded optimal SQL per task. Reproducible at seed=42."
+  random:
+    agent: RandomAgent (seed=42)
+    normalized: 0.0556
+    easy_avg:   0.0556
+    medium_avg: 0.0556
+    hard_avg:   0.0556
+    notes: "Random SQL from a small pool. Expected ~0 correctness."
+  llm_gpt4o_mini:
+    agent: LLMAgent (gpt-4o-mini, temp=0)
+    normalized: ~0.80
+    notes: "Estimated; varies by API version. Run inference.py --agent llm to reproduce."
+
+# ── Environment config ────────────────────────────────────────────────────────
+environment:
+  database:
+    engine: sqlite3
+    mode: in-memory
+    tables: [customers, products, orders, order_items, returns]
+    seed_rows: ~60
+    note: "Database is reset on each process start; state is not shared across workers."
+  constraints:
+    allowed_statements: [SELECT, WITH]
+    forbidden_statements: [INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE]
+    max_result_rows: 100
+  reward_shaping:
+    attempt_penalty: 0.10
+    syntax_bonus: 0.05
+
+# ── Deployment ────────────────────────────────────────────────────────────────
+deployment:
+  framework: gradio
+  port: 7860
+  dockerfile: Dockerfile
+  huggingface_space: "https://huggingface.co/spaces/<YOUR_USERNAME>/sql-business-intelligence"
