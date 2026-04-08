@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sql-business-intelligence-openenv"
+version = "1.0.0"
+description = "SQL Business Intelligence OpenEnv"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "pydantic>=2.0,<3.0",
+    "gradio>=4.0",
+    "openai>=2.7.2",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "pyyaml>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["env*"]
+
+[tool.openenv]
+env_id = "sql-business-intelligence-v1"
+entry_point = "env:SQLBusinessEnv"
