@@ -2,9 +2,9 @@
 inference.py — Baseline agents and benchmark runner.
 
 Mandatory env vars (per OpenEnv spec):
-  API_BASE_URL   The LLM API endpoint  (e.g. https://router.huggingface.co/v1)
-  MODEL_NAME     Model identifier      (e.g. Qwen/Qwen2.5-72B-Instruct)
-  HF_TOKEN       HuggingFace API key   (also accepted: API_KEY)
+  API_BASE_URL  The LLM API endpoint (e.g. https://router.huggingface.co/v1)
+  MODEL_NAME    Model identifier (e.g. Qwen/Qwen2.5-72B-Instruct)
+  HF_TOKEN      HuggingFace API key (also accepted: API_KEY)
 
 Usage:
   python inference.py --agent rule_based --verbose
@@ -20,11 +20,12 @@ import json
 import os
 import sys
 import textwrap
+import time
 from typing import Optional
 
 from env import SQLBusinessEnv, SQLAction, Observation
 
-# ── Mandatory credentials (per provided inference spec) ───────────────────────
+# ── Mandatory credentials (per provided inference spec) ──────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -34,7 +35,7 @@ TEMPERATURE = 0.0   # deterministic for reproducibility
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AGENTS
+# AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RuleBasedAgent:
@@ -69,23 +70,23 @@ class RuleBasedAgent:
             "JOIN customers c ON o.customer_id = c.id "
             "GROUP BY c.id, c.name "
             "HAVING COUNT(*) = ("
-            "  SELECT MAX(cnt) FROM (SELECT COUNT(*) AS cnt FROM orders GROUP BY customer_id)"
+            " SELECT MAX(cnt) FROM (SELECT COUNT(*) AS cnt FROM orders GROUP BY customer_id)"
             ") ORDER BY c.name"
         ),
         "hard_02": (
             "SELECT strftime('%Y-%m', o.order_date) || ':' || "
-            "       CAST(ROUND(SUM(oi.quantity * oi.unit_price), 2) AS TEXT) "
+            " CAST(ROUND(SUM(oi.quantity * oi.unit_price), 2) AS TEXT) "
             "FROM order_items oi JOIN orders o ON oi.order_id = o.id "
             "WHERE o.status = 'completed' AND o.order_date LIKE '2024-%' "
             "GROUP BY strftime('%Y-%m', o.order_date) ORDER BY 1"
         ),
         "hard_03": (
             "WITH pc AS ("
-            "  SELECT c.id, c.name, "
-            "         SUM(oi.quantity * oi.unit_price * (1 - o.discount_pct)) AS ns "
-            "  FROM customers c JOIN orders o ON o.customer_id = c.id "
-            "  JOIN order_items oi ON oi.order_id = o.id "
-            "  WHERE o.status = 'completed' GROUP BY c.id, c.name"
+            " SELECT c.id, c.name, "
+            " SUM(oi.quantity * oi.unit_price * (1 - o.discount_pct)) AS ns "
+            " FROM customers c JOIN orders o ON o.customer_id = c.id "
+            " JOIN order_items oi ON oi.order_id = o.id "
+            " WHERE o.status = 'completed' GROUP BY c.id, c.name"
             ") SELECT name FROM pc "
             "WHERE ns > (SELECT AVG(ns) FROM pc) ORDER BY name"
         ),
@@ -117,9 +118,7 @@ class RandomAgent:
 class LLMAgent:
     """
     Uses the OpenAI-compatible API client with the mandatory env vars:
-      API_BASE_URL, HF_TOKEN (or API_KEY), MODEL_NAME.
-
-    Matches the pattern from the official inference script example.
+    API_BASE_URL, HF_TOKEN (or API_KEY), MODEL_NAME.
     """
 
     SYSTEM_PROMPT = textwrap.dedent("""
@@ -149,7 +148,6 @@ class LLMAgent:
                 "Example: export HF_TOKEN=hf_..."
             )
 
-        # Uses API_BASE_URL + HF_TOKEN exactly as the spec requires
         self._client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
         self._model  = MODEL_NAME
 
@@ -193,7 +191,46 @@ class LLMAgent:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RUNNER
+# MANDATORY STRUCTURED LOGGING — [START] [STEP] [END]
+# Required by Scaler evaluator — any deviation causes scoring failure
+# ══════════════════════════════════════════════════════════════════════════════
+
+def log_start(task_id: str, difficulty: str, question: str):
+    print(json.dumps({
+        "event":      "START",
+        "task_id":    task_id,
+        "difficulty": difficulty,
+        "question":   question,
+    }))
+    sys.stdout.flush()
+
+
+def log_step(task_id: str, attempt: int, sql_query: str, reward: float,
+             done: bool, info: dict):
+    print(json.dumps({
+        "event":     "STEP",
+        "task_id":   task_id,
+        "attempt":   attempt,
+        "sql_query": sql_query,
+        "reward":    round(reward, 4),
+        "done":      done,
+        "info":      info,
+    }))
+    sys.stdout.flush()
+
+
+def log_end(task_id: str, best_reward: float, attempts_used: int):
+    print(json.dumps({
+        "event":         "END",
+        "task_id":       task_id,
+        "best_reward":   round(best_reward, 4),
+        "attempts_used": attempts_used,
+    }))
+    sys.stdout.flush()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_single_task(
@@ -203,24 +240,50 @@ def run_single_task(
     verbose: bool = False,
 ) -> float:
     obs = env.reset(task_id=task_id)
-    print(f"\n{'─'*64}")
-    print(f"  Task: {task_id}  |  difficulty: {obs.difficulty}")
-    print(f"  Question: {obs.question}\n")
+
+    # Mandatory [START] log
+    log_start(obs.task_id, obs.difficulty, obs.question)
+
+    if verbose:
+        print(f"\n{'─'*64}")
+        print(f"  Task: {task_id} | difficulty: {obs.difficulty}")
+        print(f"  Question: {obs.question}\n")
 
     done = False
+    attempts_used = 0
+
     while not done:
         action = agent(obs)
         result = env.step(action)
+        attempts_used += 1
+
+        # Mandatory [STEP] log
+        log_step(
+            task_id    = obs.task_id,
+            attempt    = obs.attempt + 1,
+            sql_query  = action.sql_query,
+            reward     = result.reward,
+            done       = result.done,
+            info       = result.info,
+        )
+
         if verbose:
             print(f"  Attempt {obs.attempt + 1}/{obs.max_attempts}")
             print(f"  SQL    : {action.sql_query[:100]}")
-            print(f"  Reward : {result.reward:.4f}  correctness={result.info['correctness']:.2f}")
-            print(f"  Reason : {result.info['reason']}\n")
+            print(f"  Reward : {result.reward:.4f}  correctness={result.info.get('correctness', 0):.2f}")
+            print(f"  Reason : {result.info.get('reason', '')}\n")
+
         obs  = result.observation
         done = result.done
 
     best = env.state().best_reward
-    print(f"  ► Best reward: {best:.4f}")
+
+    # Mandatory [END] log
+    log_end(obs.task_id, best, attempts_used)
+
+    if verbose:
+        print(f"  ► Best reward: {best:.4f}")
+
     return best
 
 
@@ -251,6 +314,7 @@ def main() -> None:
     print(f"  MODEL_NAME   = {MODEL_NAME}")
     print(f"  HF_TOKEN set = {'yes' if API_KEY else 'NO (llm agent will fail)'}")
     print(f"  seed         = {args.seed}")
+    sys.stdout.flush()
 
     if args.agent == "rule_based":
         agent = RuleBasedAgent()
@@ -268,28 +332,59 @@ def main() -> None:
     # Full benchmark
     print(f"\nRunning full benchmark...")
     print("─" * 64)
-    bm = env.run_benchmark(agent, verbose=args.verbose)
-    bm.agent = args.agent
+    sys.stdout.flush()
+
+    all_tasks  = [t.task_id for t in env.tasks]
+    results    = []
+    total      = 0.0
+
+    for task_id in all_tasks:
+        score = run_single_task(env, agent, task_id, verbose=args.verbose)
+        results.append({"task_id": task_id, "score": score})
+        total += score
+
+    normalized = total / len(all_tasks) if all_tasks else 0.0
 
     print(f"\n{'═'*64}")
-    print(f"  BENCHMARK — {args.agent.upper()}  (seed={args.seed})")
+    print(f"  BENCHMARK — {args.agent.upper()} (seed={args.seed})")
     print(f"{'═'*64}")
-    print(f"  Easy   avg : {bm.easy_avg:.4f}")
-    print(f"  Medium avg : {bm.medium_avg:.4f}")
-    print(f"  Hard   avg : {bm.hard_avg:.4f}")
-    print(f"  {'─'*36}")
-    print(f"  Total      : {bm.total_score:.4f} / {bm.max_score:.1f}")
-    print(f"  Normalized : {bm.normalized_score:.4f}\n")
 
-    for r in bm.per_task:
-        bar  = "█" * int(r.score * 10) + "░" * (10 - int(r.score * 10))
-        icon = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(r.difficulty, "")
-        print(f"  {icon} {r.task_id:12s} [{bar}] {r.score:.4f}  ({r.attempts_used} att)")
+    easy_scores   = [r["score"] for r in results if "easy"   in r["task_id"]]
+    medium_scores = [r["score"] for r in results if "medium" in r["task_id"]]
+    hard_scores   = [r["score"] for r in results if "hard"   in r["task_id"]]
+
+    easy_avg   = sum(easy_scores)   / len(easy_scores)   if easy_scores   else 0.0
+    medium_avg = sum(medium_scores) / len(medium_scores) if medium_scores else 0.0
+    hard_avg   = sum(hard_scores)   / len(hard_scores)   if hard_scores   else 0.0
+
+    print(f"  Easy avg   : {easy_avg:.4f}")
+    print(f"  Medium avg : {medium_avg:.4f}")
+    print(f"  Hard avg   : {hard_avg:.4f}")
+    print(f"  {'─'*36}")
+    print(f"  Total      : {total:.4f} / {len(all_tasks):.1f}")
+    print(f"  Normalized : {normalized:.4f}\n")
+
+    for r in results:
+        diff  = "easy" if "easy" in r["task_id"] else "medium" if "medium" in r["task_id"] else "hard"
+        icon  = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(diff, "")
+        bar   = "█" * int(r["score"] * 10) + "░" * (10 - int(r["score"] * 10))
+        print(f"  {icon} {r['task_id']:12s} [{bar}] {r['score']:.4f}")
 
     if args.output:
+        out = {
+            "agent":      args.agent,
+            "seed":       args.seed,
+            "easy_avg":   easy_avg,
+            "medium_avg": medium_avg,
+            "hard_avg":   hard_avg,
+            "normalized": normalized,
+            "per_task":   results,
+        }
         with open(args.output, "w") as f:
-            json.dump(bm.model_dump(), f, indent=2)
+            json.dump(out, f, indent=2)
         print(f"\n  Results saved → {args.output}")
+
+    sys.stdout.flush()
 
 
 def _strip_fences(text: str) -> str:
