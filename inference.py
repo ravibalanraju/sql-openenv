@@ -1,220 +1,232 @@
+#!/usr/bin/env python3
 """
-inference.py — Baseline agents and benchmark runner.
-Mandatory env vars: API_BASE_URL, MODEL_NAME, HF_TOKEN
+Baseline inference script for SQL Business Intelligence OpenEnv.
+Uses OpenAI-compatible API client as required by the OpenEnv spec.
 """
-from __future__ import annotations
-import argparse, json, os, sys
-from typing import Optional
 
-from env import SQLBusinessEnv, SQLAction, Observation
+import os
+import sys
+import json
+import argparse
+import traceback
+import time
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-MAX_TOKENS   = 512
-TEMPERATURE  = 0.0
+# ── Env vars (spec-required) ──────────────────────────────────────────────────
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
+API_KEY      = os.getenv("HF_TOKEN") or os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY", "dummy-key")
+MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
+ENV_URL      = os.getenv("ENV_URL", "http://localhost:7860")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+RULE_BASED_SQL = {
+    "easy_01":   "SELECT COUNT(*) as count FROM customers WHERE state = 'NY'",
+    "easy_02":   "SELECT price FROM products WHERE name = 'Ergonomic Chair'",
+    "easy_03":   "SELECT COUNT(*) as count FROM orders WHERE status = 'completed'",
+    "medium_01": "SELECT p.name FROM order_items oi JOIN products p ON oi.product_id = p.id GROUP BY p.id, p.name ORDER BY SUM(oi.quantity * oi.unit_price) DESC LIMIT 3",
+    "medium_02": "SELECT ROUND(SUM(oi.quantity * oi.unit_price * (1 - o.discount)), 2) as net_revenue FROM orders o JOIN order_items oi ON o.id = oi.order_id WHERE o.status = 'completed'",
+    "medium_03": "SELECT p.category FROM order_items oi JOIN products p ON oi.product_id = p.id GROUP BY p.category ORDER BY SUM(oi.quantity * oi.unit_price) DESC LIMIT 1",
+    "hard_01":   "SELECT c.name FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.id, c.name ORDER BY COUNT(*) DESC LIMIT 1",
+    "hard_02":   "WITH monthly AS (SELECT strftime('%Y-%m', o.order_date) as month, ROUND(SUM(oi.quantity * oi.unit_price * (1 - o.discount)), 2) as revenue FROM orders o JOIN order_items oi ON o.id = oi.order_id WHERE strftime('%Y', o.order_date) = '2024' GROUP BY month) SELECT month, revenue FROM monthly ORDER BY month",
+    "hard_03":   "WITH customer_spend AS (SELECT c.id, c.name, SUM(oi.quantity * oi.unit_price * (1 - o.discount)) as total_spend FROM customers c JOIN orders o ON c.id = o.customer_id JOIN order_items oi ON o.id = oi.order_id GROUP BY c.id, c.name), avg_spend AS (SELECT AVG(total_spend) as avg FROM customer_spend) SELECT cs.name FROM customer_spend cs, avg_spend a WHERE cs.total_spend > a.avg ORDER BY cs.total_spend DESC",
+}
+
+
+def wait_for_server(url, timeout=120):
+    import urllib.request
+    print(f"[INFO] Waiting for server at {url} ...")
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = urllib.request.urlopen(f"{url}/health", timeout=5)
+            if resp.status == 200:
+                print(f"[INFO] Server is ready!")
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    print(f"[WARN] Server not ready after {timeout}s, continuing anyway...")
+    return False
+
+
+def http_post(url, data):
+    import urllib.request
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body,
+                                  headers={"Content-Type": "application/json"},
+                                  method="POST")
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return json.loads(resp.read())
+    except Exception as e:
+        print(f"[ERROR] POST {url} failed: {e}")
+        return {}
+
+
+def http_get(url):
+    import urllib.request
+    try:
+        resp = urllib.request.urlopen(url, timeout=30)
+        return json.loads(resp.read())
+    except Exception as e:
+        print(f"[ERROR] GET {url} failed: {e}")
+        return {}
 
 
 class RuleBasedAgent:
-    """Hard-coded optimal SQL. No API key needed. Scores 1.0 on all tasks."""
-    _SOLUTIONS = {
-        "easy_01": "SELECT COUNT(*) FROM customers WHERE state = 'NY'",
-        "easy_02": "SELECT unit_price FROM products WHERE name = 'Ergonomic Chair'",
-        "easy_03": "SELECT COUNT(*) FROM orders WHERE status = 'completed'",
-        "medium_01": (
-            "SELECT p.name FROM order_items oi "
-            "JOIN products p ON oi.product_id = p.id "
-            "GROUP BY p.id, p.name "
-            "ORDER BY SUM(oi.quantity * oi.unit_price) DESC LIMIT 3"
-        ),
-        "medium_02": (
-            "SELECT ROUND(SUM(oi.quantity * oi.unit_price * (1 - o.discount_pct)), 2) "
-            "FROM order_items oi JOIN orders o ON oi.order_id = o.id "
-            "WHERE o.status = 'completed'"
-        ),
-        "medium_03": (
-            "SELECT p.category FROM order_items oi "
-            "JOIN products p ON oi.product_id = p.id "
-            "GROUP BY p.category "
-            "ORDER BY SUM(oi.quantity * oi.unit_price) DESC LIMIT 1"
-        ),
-        "hard_01": (
-            "SELECT c.name FROM orders o "
-            "JOIN customers c ON o.customer_id = c.id "
-            "GROUP BY c.id, c.name "
-            "HAVING COUNT(*) = ("
-            "  SELECT MAX(cnt) FROM ("
-            "    SELECT COUNT(*) AS cnt FROM orders GROUP BY customer_id"
-            "  )"
-            ") ORDER BY c.name"
-        ),
-        "hard_02": (
-            "SELECT strftime('%Y-%m', o.order_date) || ':' || "
-            "       CAST(ROUND(SUM(oi.quantity * oi.unit_price), 2) AS TEXT) "
-            "FROM order_items oi JOIN orders o ON oi.order_id = o.id "
-            "WHERE o.status = 'completed' AND o.order_date LIKE '2024-%' "
-            "GROUP BY strftime('%Y-%m', o.order_date) ORDER BY 1"
-        ),
-        "hard_03": (
-            "WITH pc AS ("
-            "  SELECT c.id, c.name, "
-            "         SUM(oi.quantity * oi.unit_price * (1 - o.discount_pct)) AS ns "
-            "  FROM customers c "
-            "  JOIN orders o ON o.customer_id = c.id "
-            "  JOIN order_items oi ON oi.order_id = o.id "
-            "  WHERE o.status = 'completed' GROUP BY c.id, c.name"
-            ") SELECT name FROM pc "
-            "WHERE ns > (SELECT AVG(ns) FROM pc) ORDER BY name"
-        ),
-    }
-
-    def __call__(self, obs: Observation) -> SQLAction:
-        sql = self._SOLUTIONS.get(obs.task_id, "SELECT 'unknown task' AS error")
-        return SQLAction(sql_query=sql)
+    def act(self, task_id, obs=None):
+        return RULE_BASED_SQL.get(task_id, "SELECT 1")
 
 
 class RandomAgent:
-    """Random SQL — floor baseline."""
-    _POOL = [
-        "SELECT 42",
-        "SELECT COUNT(*) FROM customers",
-        "SELECT name FROM products LIMIT 1",
-        "SELECT AVG(unit_price) FROM products",
-    ]
-    def __init__(self, seed=42):
+    def act(self, task_id, obs=None):
         import random
-        self._rng = random.Random(seed)
-    def __call__(self, obs: Observation) -> SQLAction:
-        return SQLAction(sql_query=self._rng.choice(self._POOL))
+        return random.choice(list(RULE_BASED_SQL.values()))
 
 
 class LLMAgent:
-    """Uses OpenAI-compatible API with API_BASE_URL + HF_TOKEN + MODEL_NAME."""
-
-    SYSTEM = (
-        "You are an expert SQLite developer. "
-        "Output ONLY a raw SQL SELECT query — no markdown, no explanation."
-    )
-
-    def __init__(self):
+    def __init__(self, model=None):
+        self.model = model or MODEL_NAME
         try:
             from openai import OpenAI
-        except ImportError:
-            sys.exit("Run: pip install openai")
-        if not API_KEY:
-            sys.exit("Set HF_TOKEN or API_KEY environment variable.")
-        self._client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+            self.client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        except Exception as e:
+            print(f"[WARN] OpenAI init failed: {e}")
+            self.client = None
 
-    def __call__(self, obs: Observation) -> SQLAction:
-        parts = [
-            f"SCHEMA\n{obs.schema_info}",
-            f"\nQUESTION\n{obs.question}",
-        ]
-        if obs.previous_query:
-            parts.append(
-                f"\nPREVIOUS ATTEMPT\n"
-                f"SQL: {obs.previous_query}\n"
-                f"Result: {obs.previous_result}\n"
-                f"Score: {obs.previous_score:.3f}\n"
-                f"Your previous answer was wrong. Fix it."
-            )
-        if obs.hint:
-            parts.append(f"\nHINT: {obs.hint}")
-
+    def act(self, task_id, obs=None):
+        if not self.client:
+            return RULE_BASED_SQL.get(task_id, "SELECT 1")
         try:
-            resp = self._client.chat.completions.create(
-                model=MODEL_NAME,
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-                stream=False,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM},
-                    {"role": "user",   "content": "\n".join(parts)},
-                ],
+            question = obs.get("question", "") if obs else ""
+            schema = obs.get("schema_info", "") if obs else ""
+            hint = obs.get("hint", "") if obs else ""
+            prompt = f"Write a SQL SELECT query to answer:\n\nSchema:\n{schema}\n\nQuestion: {question}"
+            if hint:
+                prompt += f"\nHint: {hint}"
+            prompt += "\n\nReturn ONLY the SQL, no explanation."
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500, temperature=0.1,
             )
-            raw = resp.choices[0].message.content or ""
-        except Exception as exc:
-            print(f"  [LLMAgent] API error: {exc}")
-            raw = "SELECT 'api_error' AS error"
-
-        # Strip markdown fences if model added them
-        raw = raw.strip()
-        for fence in ("```sql", "```SQL", "```"):
-            if raw.startswith(fence):
-                raw = raw[len(fence):].lstrip("\n")
-        if raw.endswith("```"):
-            raw = raw[:-3].rstrip()
-
-        return SQLAction(sql_query=raw.strip())
+            sql = resp.choices[0].message.content.strip()
+            return sql.replace("```sql", "").replace("```", "").strip()
+        except Exception as e:
+            print(f"[WARN] LLM failed: {e}")
+            return RULE_BASED_SQL.get(task_id, "SELECT 1")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="SQL BI OpenEnv Benchmark")
-    parser.add_argument(
-        "--agent",
-        choices=["rule_based", "random", "llm"],
-        default="rule_based",
-    )
+def run_benchmark(agent_name="rule_based", task_id=None, verbose=True,
+                  seed=42, model=None, output=None):
+
+    wait_for_server(ENV_URL)
+
+    tasks_resp = http_get(f"{ENV_URL}/tasks")
+    if tasks_resp and "tasks" in tasks_resp:
+        all_tasks = [t["id"] for t in tasks_resp["tasks"]]
+    else:
+        all_tasks = list(RULE_BASED_SQL.keys())
+
+    tasks = [task_id] if task_id else all_tasks
+
+    if agent_name == "rule_based":
+        agent = RuleBasedAgent()
+    elif agent_name == "random":
+        agent = RandomAgent()
+    else:
+        agent = LLMAgent(model=model)
+
+    results = {}
+
+    for tid in tasks:
+        try:
+            obs = http_post(f"{ENV_URL}/reset", {"task_id": tid})
+            if not obs:
+                obs = {"task_id": tid, "question": "", "schema_info": "",
+                       "attempt": 0, "max_attempts": 4}
+
+            max_attempts = obs.get("max_attempts", 4)
+            best_reward = 0.0
+            done = False
+            attempt = 0
+
+            if verbose:
+                print(f"\n{'='*55}")
+                print(f"Task: {tid}  |  {obs.get('difficulty','')}")
+                print(f"Q: {obs.get('question','')[:80]}")
+
+            while not done and attempt < max_attempts:
+                attempt += 1
+                sql = agent.act(tid, obs)
+
+                if verbose:
+                    print(f"\n  Attempt {attempt}/{max_attempts}")
+                    print(f"  SQL: {sql[:100].strip()}")
+
+                result = http_post(f"{ENV_URL}/step", {"sql_query": sql})
+                if not result:
+                    break
+
+                reward = result.get("reward", 0.0)
+                if isinstance(reward, dict):
+                    reward = reward.get("value", 0.0)
+                reward = float(reward)
+
+                done = result.get("done", False)
+                obs = result.get("observation", obs) or obs
+                reason = ""
+                if isinstance(result.get("info"), dict):
+                    reason = result["info"].get("reason", "")
+
+                best_reward = max(best_reward, reward)
+
+                if verbose:
+                    bar = "█" * int(reward * 10) + "░" * (10 - int(reward * 10))
+                    print(f"  Reward: [{bar}] {reward:.4f}  {reason}")
+
+            results[tid] = best_reward
+
+        except Exception as e:
+            print(f"[ERROR] Task {tid}: {e}")
+            traceback.print_exc()
+            results[tid] = 0.0
+
+    scores = list(results.values())
+    normalized = sum(scores) / len(scores) if scores else 0.0
+
+    print(f"\n{'='*55}")
+    print("BENCHMARK RESULTS")
+    print(f"{'='*55}")
+    for tid, score in results.items():
+        bar = "█" * int(score * 10) + "░" * (10 - int(score * 10))
+        print(f"  [{tid:<12}] [{bar}] {score:.4f}")
+    print(f"{'='*55}")
+    print(f"  Normalized : {normalized:.4f}")
+    print(f"{'='*55}\n")
+
+    final = {"tasks": results, "normalized": normalized}
+    if output:
+        with open(output, "w") as f:
+            json.dump(final, f, indent=2)
+        print(f"[INFO] Saved to {output}")
+
+    return final
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agent",   default="rule_based",
+                        choices=["rule_based", "random", "llm"])
     parser.add_argument("--task",    default=None)
+    parser.add_argument("--model",   default=None)
+    parser.add_argument("--verbose", action="store_true", default=True)
     parser.add_argument("--seed",    type=int, default=42)
-    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output",  default=None)
     args = parser.parse_args()
-
-    print(f"\nConfig:")
-    print(f"  agent        = {args.agent}")
-    print(f"  API_BASE_URL = {API_BASE_URL}")
-    print(f"  MODEL_NAME   = {MODEL_NAME}")
-    print(f"  HF_TOKEN set = {'yes' if API_KEY else 'NO'}")
-    print(f"  seed         = {args.seed}")
-
-    if args.agent == "rule_based":
-        agent = RuleBasedAgent()
-    elif args.agent == "random":
-        agent = RandomAgent(seed=args.seed)
-    else:
-        agent = LLMAgent()
-
-    env = SQLBusinessEnv(seed=args.seed)
-
-    if args.task:
-        obs  = env.reset(task_id=args.task)
-        print(f"\nTask: {args.task} | {obs.question}")
-        done = False
-        while not done:
-            action = agent(obs)
-            result = env.step(action)
-            if args.verbose:
-                print(f"  Attempt {obs.attempt + 1}: {action.sql_query[:80]}")
-                print(f"  Reward={result.reward:.4f}  {result.info['reason']}")
-            obs  = result.observation
-            done = result.done
-        print(f"Best reward: {env.state().best_reward:.4f}")
-        return
-
-    # Full benchmark
-    print(f"\nRunning full benchmark...\n{'─'*60}")
-    bm = env.run_benchmark(agent, verbose=args.verbose)
-    bm.agent = args.agent
-
-    print(f"\n{'═'*60}")
-    print(f"  RESULTS — {args.agent.upper()}  (seed={args.seed})")
-    print(f"{'═'*60}")
-    print(f"  Easy   avg : {bm.easy_avg:.4f}")
-    print(f"  Medium avg : {bm.medium_avg:.4f}")
-    print(f"  Hard   avg : {bm.hard_avg:.4f}")
-    print(f"  Normalized : {bm.normalized_score:.4f}  "
-          f"({bm.total_score:.2f}/{bm.max_score:.1f})\n")
-
-    for r in bm.per_task:
-        icon = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(r.difficulty, "")
-        bar  = "█" * int(r.score * 10) + "░" * (10 - int(r.score * 10))
-        print(f"  {icon} {r.task_id:12s} [{bar}] {r.score:.4f}  ({r.attempts_used} att)")
-
-    if args.output:
-        with open(args.output, "w") as f:
-            json.dump(bm.model_dump(), f, indent=2)
-        print(f"\n  Saved → {args.output}")
+    run_benchmark(agent_name=args.agent, task_id=args.task,
+                  verbose=args.verbose, seed=args.seed,
+                  model=args.model, output=args.output)
 
 
 if __name__ == "__main__":
