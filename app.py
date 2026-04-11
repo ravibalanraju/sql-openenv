@@ -55,12 +55,9 @@ def step(req: StepRequest):
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-    # Get raw reward
+    # Get reward — strictly between 0.05 and 0.95
     reward = float(result.reward)
-
-    # Clamp strictly between 0 and 1 (exclusive)
-    # Never return exactly 0.0 or 1.0
-    reward = max(0.01, min(0.99, reward))
+    reward = round(max(0.05, min(0.95, reward)), 4)
 
     return {
         "observation": result.observation.model_dump()
@@ -73,7 +70,8 @@ def step(req: StepRequest):
         if hasattr(result.reward_detail, "model_dump")
         else result.reward_detail.__dict__,
 
-        "done": True,
+        # ✅ FIXED: use actual done from result, not hardcoded True
+        "done": result.done,
         "info": result.info,
     }
 
@@ -98,7 +96,7 @@ def tasks():
             {
                 "id": t.task_id,
                 "difficulty": t.difficulty,
-                "description": t.question[:80]
+                "description": t.question[:80],
             }
             for t in TASKS
         ]

@@ -14,9 +14,12 @@ client = OpenAI(
     api_key=API_KEY
 )
 
-# All 9 tasks
-TASKS = ["easy_01", "easy_02", "easy_03", "medium_01", "medium_02", "medium_03",
-         "hard_01", "hard_02", "hard_03"]
+# All 9 tasks (minimum 3 required)
+TASKS = [
+    "easy_01", "easy_02", "easy_03",
+    "medium_01", "medium_02", "medium_03",
+    "hard_01", "hard_02", "hard_03",
+]
 
 
 def call_llm():
