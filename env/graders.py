@@ -1,10 +1,5 @@
-"""
-Graders for the SQL BI OpenEnv.
-All scores are strictly between 0.0 and 1.0 (exclusive).
-"""
 from __future__ import annotations
 from typing import Any, Optional, Tuple
-
 from env.models import Reward
 
 
@@ -72,15 +67,12 @@ def _grade_ordered_list(rows, expected: list) -> Tuple[float, str]:
     if got_set == exp_set:
         return 0.5, f"Right items, wrong order. Got: {got}"
 
+    overlap = len(got_set & exp_set)
     positional = sum(1 for a, b in zip(got, exp) if a == b)
-    overlap    = len(got_set & exp_set)
     score = round(max(positional, overlap) / max(len(exp), 1), 2)
-    score = min(score, 0.85)
-    score = max(score, 0.05)
+    score = min(max(score, 0.05), 0.85)
 
-    if score > 0.05:
-        return score, f"Partial ({overlap}/{len(exp)} items match). Expected: {exp}. Got: {got}"
-    return 0.05, f"No matching items. Expected: {exp}. Got: {got}"
+    return score, f"Partial ({overlap}/{len(exp)} items). Expected: {exp}. Got: {got}"
 
 
 def compute_reward(
@@ -92,12 +84,8 @@ def compute_reward(
     max_attempts: int,
     attempt_penalty: float = 0.10,
 ) -> Reward:
-    # Step 1: syntax signal
-    syntax_bonus = 0.0
-    if error is None and rows is not None:
-        syntax_bonus = 0.05
+    syntax_bonus = 0.05 if (error is None and rows is not None) else 0.0
 
-    # Step 2: correctness
     if error:
         correctness, reason = 0.05, f"SQL error: {error}"
     elif rows is None:
@@ -114,17 +102,13 @@ def compute_reward(
         else:
             correctness, reason = 0.05, f"Unknown answer_type: {answer_type}"
 
-    # No syntax bonus if already at max
     if correctness >= 0.95:
         syntax_bonus = 0.0
 
-    # Step 3: attempt penalty
     penalty = round(attempt_penalty * attempt, 4)
-
-    # Step 4: combine — STRICTLY between 0.0 and 1.0
     raw = correctness + syntax_bonus - penalty
 
-    # ✅ FIXED parenthesis — returns float not tuple
+    # ✅ FIXED: correct parenthesis — returns float not tuple
     value = round(max(0.05, min(0.95, raw)), 4)
 
     return Reward(

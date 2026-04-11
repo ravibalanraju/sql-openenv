@@ -11,11 +11,9 @@ from pydantic import BaseModel as PydanticModel
 from env import SQLBusinessEnv, SQLAction
 from env.tasks import TASKS
 
-# ── Shared env ─────────────────────────────────────────────
 _env = SQLBusinessEnv(seed=42)
 _lock = threading.Lock()
 
-# ── FastAPI ────────────────────────────────────────────────
 api = FastAPI()
 
 
@@ -27,13 +25,11 @@ class StepRequest(PydanticModel):
     sql_query: str
 
 
-# ── HEALTH ─────────────────────────────────────────────────
 @api.get("/health")
 def health():
     return {"status": "ok", "env": "sql-business-intelligence-v1"}
 
 
-# ── RESET ──────────────────────────────────────────────────
 @api.post("/reset")
 def reset(req: ResetRequest = None):
     task_id = (req.task_id if req else None)
@@ -45,7 +41,6 @@ def reset(req: ResetRequest = None):
     return obs.model_dump() if hasattr(obs, "model_dump") else obs.__dict__
 
 
-# ── STEP ───────────────────────────────────────────────────
 @api.post("/step")
 def step(req: StepRequest):
     with _lock:
@@ -55,28 +50,21 @@ def step(req: StepRequest):
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-    # Get reward — strictly between 0.05 and 0.95
-    reward = float(result.reward)
-    reward = round(max(0.05, min(0.95, reward)), 4)
+    reward = round(max(0.05, min(0.95, float(result.reward))), 4)
 
     return {
         "observation": result.observation.model_dump()
         if hasattr(result.observation, "model_dump")
         else result.observation.__dict__,
-
         "reward": reward,
-
         "reward_detail": result.reward_detail.model_dump()
         if hasattr(result.reward_detail, "model_dump")
         else result.reward_detail.__dict__,
-
-        # ✅ FIXED: use actual done from result, not hardcoded True
         "done": result.done,
         "info": result.info,
     }
 
 
-# ── STATE ──────────────────────────────────────────────────
 @api.get("/state")
 @api.post("/state")
 def state():
@@ -88,28 +76,21 @@ def state():
     return s.model_dump() if hasattr(s, "model_dump") else s.__dict__
 
 
-# ── TASKS ──────────────────────────────────────────────────
 @api.get("/tasks")
 def tasks():
     return {
         "tasks": [
-            {
-                "id": t.task_id,
-                "difficulty": t.difficulty,
-                "description": t.question[:80],
-            }
+            {"id": t.task_id, "difficulty": t.difficulty, "description": t.question[:80]}
             for t in TASKS
         ]
     }
 
 
-# ── ROOT ───────────────────────────────────────────────────
 @api.get("/")
 def root():
     return JSONResponse({"status": "ok", "health": "/health", "tasks": "/tasks"})
 
 
-# ── MAIN ───────────────────────────────────────────────────
 def main():
     uvicorn.run(api, host="0.0.0.0", port=7860)
 
