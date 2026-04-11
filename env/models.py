@@ -1,7 +1,6 @@
 """
-OpenEnv typed models — Pydantic v2 (falls back to dataclasses when pydantic is not installed).
-
-In production (Docker / HF Space) pydantic IS installed, so the real BaseModel path runs.
+OpenEnv typed models — Pydantic v2
+All reward values are strictly between 0.0 and 1.0 (exclusive).
 """
 from __future__ import annotations
 
@@ -12,38 +11,34 @@ try:
 
     _USING_PYDANTIC = True
 
-    # ── Action ────────────────────────────────────────────────────────────────
-
     class SQLAction(BaseModel):
-        """The one action an agent can take: submit a SQL SELECT query."""
         sql_query: str = Field(..., description="A SQLite SELECT (or WITH…SELECT) query.")
 
-    # ── Observation ───────────────────────────────────────────────────────────
-
     class Observation(BaseModel):
-        """Everything the agent can see at each timestep."""
         task_id: str
-        difficulty: str = Field(..., description="easy | medium | hard")
-        question: str = Field(..., description="Natural-language business question.")
-        schema_info: str = Field(..., description="Database schema DDL.")
-        attempt: int = Field(0, ge=0, description="0-indexed attempt counter.")
+        difficulty: str
+        question: str
+        schema_info: str
+        attempt: int = Field(0, ge=0)
         max_attempts: int = Field(3, ge=1)
         previous_query: Optional[str] = None
         previous_result: Optional[str] = None
-        previous_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+        previous_score: Optional[float] = None
         hint: Optional[str] = None
 
-    # ── Reward ────────────────────────────────────────────────────────────────
-
     class Reward(BaseModel):
-        """Structured reward breakdown — the OpenEnv spec requires a typed Reward model."""
-        value: float = Field(..., ge=0.0, le=1.0, description="Final reward for this step.")
-        correctness: float = Field(0.0, ge=0.0, le=1.0)
+        # strictly between 0 and 1 — gt/lt instead of ge/le
+        value: float = Field(..., gt=0.0, lt=1.0,
+                             description="Final reward strictly between 0 and 1.")
+        correctness: float = Field(0.05, ge=0.0, le=1.0)
         attempt_penalty: float = Field(0.0, ge=0.0, le=1.0)
         syntax_bonus: float = Field(0.0, ge=0.0, le=1.0)
         reason: str = ""
 
-    # ── Step Result ───────────────────────────────────────────────────────────
+        def model_post_init(self, __context: Any) -> None:
+            # Clamp value to be strictly between 0 and 1
+            object.__setattr__(self, 'value',
+                               round(max(0.05, min(0.95, self.value)), 4))
 
     class StepResult(BaseModel):
         observation: Observation
@@ -51,8 +46,6 @@ try:
         reward_detail: Reward
         done: bool
         info: Dict[str, Any] = Field(default_factory=dict)
-
-    # ── State ─────────────────────────────────────────────────────────────────
 
     class EnvState(BaseModel):
         task_id: str
@@ -69,19 +62,15 @@ try:
             import json
             return json.dumps(self.model_dump(), **kw)
 
-    # ── Task Definition ───────────────────────────────────────────────────────
-
     class TaskDefinition(BaseModel):
         task_id: str
         difficulty: str
         question: str
         expected_answer: Any
-        answer_type: str   # scalar_int | scalar_float | scalar_string | ordered_list | set_match
+        answer_type: str
         hint: Optional[str] = None
         max_attempts: int = 3
         points: float = 1.0
-
-    # ── Benchmark ─────────────────────────────────────────────────────────────
 
     class TaskResult(BaseModel):
         task_id: str
@@ -102,12 +91,11 @@ try:
         hard_avg: float
 
 except ModuleNotFoundError:
-    # ── stdlib fallback (sandbox / CI without pydantic installed) ─────────────
     from dataclasses import dataclass, field as dc_field
 
     _USING_PYDANTIC = False
 
-    def Field(default=None, **_):  # noqa: N802
+    def Field(default=None, **_):
         return default
 
     @dataclass
@@ -132,10 +120,12 @@ except ModuleNotFoundError:
     @dataclass
     class Reward:
         value: float
-        correctness: float = 0.0
+        correctness: float = 0.05
         attempt_penalty: float = 0.0
         syntax_bonus: float = 0.0
         reason: str = ""
+        def __post_init__(self):
+            self.value = round(max(0.05, min(0.95, self.value)), 4)
         def model_dump(self): return self.__dict__.copy()
 
     @dataclass
@@ -145,11 +135,6 @@ except ModuleNotFoundError:
         reward_detail: Reward
         done: bool
         info: dict = dc_field(default_factory=dict)
-        def model_dump(self):
-            return {"observation": self.observation.model_dump(),
-                    "reward": self.reward,
-                    "reward_detail": self.reward_detail.model_dump(),
-                    "done": self.done, "info": self.info}
 
     @dataclass
     class EnvState:
@@ -202,9 +187,3 @@ except ModuleNotFoundError:
         easy_avg: float
         medium_avg: float
         hard_avg: float
-        def model_dump(self):
-            return {"agent": self.agent, "total_score": self.total_score,
-                    "max_score": self.max_score, "normalized_score": self.normalized_score,
-                    "per_task": [r.model_dump() for r in self.per_task],
-                    "easy_avg": self.easy_avg, "medium_avg": self.medium_avg,
-                    "hard_avg": self.hard_avg}
